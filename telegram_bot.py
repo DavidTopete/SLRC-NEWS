@@ -2,7 +2,7 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 from io import BytesIO
 from PIL import Image
 import time
@@ -122,8 +122,33 @@ FUENTES = [
         "requiere_mencion": True
     },
     {
-        # OEM bloquea muchos accesos automatizados (403). Se mantiene
-        # por si desde tu servidor sí responde.
+        # oem.com.mx bloquea las conexiones automatizadas (403), así que
+        # las notas de Tribuna se obtienen del RSS público de Bing News
+        # (verificado 23/11/2026: ~12 notas con link directo, fecha e imagen).
+        "nombre": "Tribuna de San Luis (vía Bing News)",
+        "medio": "Tribuna de San Luis",
+        "tipo": "rss",
+        "url": (
+            "https://www.bing.com/news/search?"
+            "q=site%3Aoem.com.mx%2Ftribunadesanluis&format=rss"
+        ),
+        "requiere_mencion": False,
+        "solo_dominio": "oem.com.mx/tribunadesanluis/"
+    },
+    {
+        "nombre": "Tribuna de San Luis - Policiaca (vía Bing News)",
+        "medio": "Tribuna de San Luis",
+        "tipo": "rss",
+        "url": (
+            "https://www.bing.com/news/search?"
+            "q=site%3Aoem.com.mx%2Ftribunadesanluis%2Fpoliciaca&format=rss"
+        ),
+        "requiere_mencion": False,
+        "solo_dominio": "oem.com.mx/tribunadesanluis/"
+    },
+    {
+        # Lectura directa de oem.com.mx: normalmente responde 403.
+        # Se mantiene por si desde tu servidor sí funciona.
         "nombre": "Tribuna de San Luis",
         "medio": "Tribuna de San Luis",
         "tipo": "html",
@@ -1439,8 +1464,33 @@ def leer_fuente_html(fuente, embudo):
     return noticias
 
 
+def desenvolver_link_agregador(link):
+    """
+    Bing News entrega links tipo:
+      http://www.bing.com/news/apiclick.aspx?...&url=https%3a%2f%2foem.com.mx%2f...
+    Se extrae la URL real del artículo (parámetro url=).
+    """
+    if not link:
+        return link
+
+    p = urlparse(link)
+
+    if "bing.com" in p.netloc.lower() and "apiclick" in p.path.lower():
+        destino = parse_qs(p.query).get("url", [None])[0]
+        if destino and es_url_http(destino):
+            return destino
+
+    return link
+
+
 def imagen_de_item_rss(item):
     media = "{http://search.yahoo.com/mrss/}"
+
+    # Bing News: <News:Image>http://www.bing.com/th?id=...</News:Image>
+    for nodo in item.iter():
+        etiqueta = str(nodo.tag).rsplit("}", 1)[-1].split(":")[-1]
+        if etiqueta.lower() == "image" and (nodo.text or "").strip().startswith("http"):
+            return nodo.text.strip().replace("http://", "https://", 1)
 
     for etiqueta in (f"{media}content", f"{media}thumbnail"):
         for nodo in item.iter(etiqueta):
@@ -1489,9 +1539,16 @@ def leer_fuente_rss(fuente, embudo):
 
     for posicion, item in enumerate(items):
         titulo = re.sub(r"\s+", " ", item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
+        link = desenvolver_link_agregador((item.findtext("link") or "").strip())
 
         if not es_url_http(link):
+            embudo["no_articulo"] += 1
+            continue
+
+        # Agregadores (Bing): aceptar solo notas del sitio indicado.
+        if fuente.get("solo_dominio") and (
+            fuente["solo_dominio"] not in link or not parece_articulo(link)
+        ):
             embudo["no_articulo"] += 1
             continue
 
