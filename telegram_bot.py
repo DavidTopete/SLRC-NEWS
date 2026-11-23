@@ -36,10 +36,12 @@ TZ = ZoneInfo("America/Hermosillo")
 UMBRAL_SIMILITUD_TITULO = 0.80
 MAX_HISTORIAL = 1000
 MAX_NOTICIAS_POR_CORRIDA = 10
+MAX_CANDIDATAS_A_REVISAR = 80
+DIAS_RETROCESO = 7
 
 # El bot corre una vez al día a las 04:00.
 # Se aceptan notas de hoy y ayer.
-ACEPTAR_HOY_Y_AYER = True
+ACEPTAR_HOY_Y_AYER = False
 
 # Tamaño máximo que intentaremos descargar como imagen.
 MAX_IMAGE_BYTES = 18 * 1024 * 1024
@@ -360,57 +362,30 @@ class Historial:
 # ============================================================
 
 def es_noticia_slrc(titulo, link):
-    texto = limpiar_texto(
-        f"{titulo} {link}"
+    """Acepta noticias de la sección local y referencias explícitas a SLRC."""
+    texto_titulo = limpiar_texto(titulo)
+    url = urlparse(link)
+    ruta = url.path.lower()
+    dominio = url.netloc.lower()
+
+    referencias = (
+        "san luis rio colorado", "slrc", "san luis rc",
+        "san luis r c", "golfo de santa clara", "luis b sanchez",
+        "valle de san luis"
     )
-
-    claves_locales = [
-        "san luis rio colorado",
-        "slrc",
-        "san luis rc",
-        "san luis r c",
-        "san luis sonora",
-        "golfo de santa clara",
-        "luis b sanchez",
-        "valle de san luis",
-        "/sanluis/",
-        "tribunadesanluis"
-    ]
-
-    ciudades_excluidas = [
-        "hermosillo",
-        "nogales",
-        "guaymas",
-        "ciudad obregon",
-        "obregon",
-        "caborca",
-        "navojoa",
-        "cananea",
-        "agua prieta",
-        "puerto penasco",
-        "magdalena",
-        "sonoyta",
-        "tijuana",
-        "ensenada"
-    ]
-
-    # Si el título menciona explícitamente otra ciudad,
-    # solo se acepta cuando también menciona claramente SLRC.
-    for ciudad in ciudades_excluidas:
-        if ciudad in texto:
-            if (
-                "san luis rio colorado" not in texto
-                and "slrc" not in texto
-                and "san luis rc" not in texto
-                and "golfo de santa clara" not in texto
-                and "luis b sanchez" not in texto
-            ):
-                return False
-
-    return any(
-        limpiar_texto(clave) in texto
-        for clave in claves_locales
+    menciona_region = any(x in texto_titulo for x in referencias)
+    seccion_local = (
+        ("elimparcial.com" in dominio and "/mxl/sanluis/" in ruta)
+        or ("oem.com.mx" in dominio and "/tribunadesanluis/" in ruta)
     )
+    otras_ciudades = (
+        "hermosillo", "nogales", "guaymas", "ciudad obregon",
+        "caborca", "navojoa", "cananea", "agua prieta",
+        "puerto penasco", "tijuana", "ensenada"
+    )
+    if any(ciudad in texto_titulo for ciudad in otras_ciudades) and not menciona_region:
+        return False
+    return menciona_region or seccion_local
 
 
 # ============================================================
@@ -525,20 +500,11 @@ def extraer_fecha_desde_soup(soup):
 
 
 def fecha_aceptable(fecha):
-    if not fecha:
-        # Si no se detecta la fecha, no se pierde la nota.
-        return True
-
+    """Acepta artículos de los últimos DIAS_RETROCESO días."""
+    if fecha is None:
+        return True  # Sin metadatos: se mantiene como candidato, no como fecha verificada.
     hoy = datetime.now(TZ).date()
-    ayer = hoy - timedelta(days=1)
-
-    if ACEPTAR_HOY_Y_AYER:
-        return fecha.date() in (
-            hoy,
-            ayer
-        )
-
-    return fecha.date() == hoy
+    return hoy - timedelta(days=DIAS_RETROCESO) <= fecha.date() <= hoy
 
 
 # ============================================================
@@ -1147,13 +1113,10 @@ def parece_articulo(link):
 
     # Para Tribuna, los artículos terminan normalmente en un ID numérico.
     if "oem.com.mx/tribunadesanluis" in link:
-        if re.search(
-            r"-\d{6,}$",
-            path.rstrip("/")
-        ):
+        if re.search(r"-\d{5,}$", path.rstrip("/")):
             return True
-
-        return False
+        # Algunos artículos nuevos pueden usar un formato distinto de ID.
+        return len(path.rstrip("/").split("/")) >= 4 and len(path.rstrip("/").split("/")[-1]) > 25
 
     # Para El Imparcial, las notas de San Luis usan /mxl/sanluis/YYYY/MM/DD/...
     if "elimparcial.com" in link:
@@ -1311,14 +1274,16 @@ def obtener_noticias(
             noticia
         )
 
-        if (
-            len(noticias_finales)
-            >= MAX_NOTICIAS_POR_CORRIDA
-        ):
+        if len(noticias_finales) >= MAX_CANDIDATAS_A_REVISAR:
             break
 
         time.sleep(0.3)
 
+    # Priorizar artículos fechados recientemente; los sin fecha quedan al final.
+    noticias_finales.sort(
+        key=lambda n: n.get("fecha") or datetime.min.replace(tzinfo=TZ),
+        reverse=True
+    )
     return noticias_finales
 
 
@@ -1586,10 +1551,9 @@ def main():
         f"<b>Fecha:</b> {ahora}"
     )
 
-    enviar_mensaje(
-        encabezado,
-        mostrar_preview=False
-    )
+    if not enviar_mensaje(encabezado, mostrar_preview=False):
+        log.error("No se pudo publicar el encabezado; se cancela la ejecución.")
+        return
 
     time.sleep(2)
 
@@ -1601,6 +1565,8 @@ def main():
     total_fallidas = 0
 
     for noticia in noticias_a_enviar:
+        if total_enviadas >= MAX_NOTICIAS_POR_CORRIDA:
+            break
 
         enviado = enviar_noticia(
             noticia
