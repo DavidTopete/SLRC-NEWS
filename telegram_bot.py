@@ -33,8 +33,21 @@ ARCHIVO_ENVIADAS = "noticias_enviadas.json"
 # San Luis Río Colorado / Sonora
 TZ = ZoneInfo("America/Hermosillo")
 
+# Similitud de títulos: se calcula sobre palabras DISTINTIVAS (sin
+# stopwords ni "San Luis Río Colorado"), con índice de Jaccard.
 UMBRAL_SIMILITUD_TITULO = 0.80
+MIN_TOKENS_COMPARABLES = 3
+# Solo se comparan títulos contra los N más recientes del historial
+# (la deduplicación por link sigue usando el historial completo).
+MAX_TITULOS_COMPARAR = 300
 MAX_HISTORIAL = 1000
+
+# DRY_RUN=1 -> no envía a Telegram ni modifica el historial (diagnóstico).
+DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
+# DEBUG=1 -> registra cada link descartado y el motivo.
+DEBUG = os.getenv("DEBUG", "0") == "1"
+
+LIMITE_CAPTION = 1024
 MAX_NOTICIAS_POR_CORRIDA = 10
 MAX_CANDIDATAS_A_REVISAR = 80
 DIAS_RETROCESO = 7
@@ -150,17 +163,53 @@ def escapar_html(texto):
     )
 
 
+PALABRAS_IGNORAR = {
+    # Stopwords
+    "a", "al", "ante", "con", "de", "del", "el", "en", "es", "la", "las",
+    "lo", "los", "para", "por", "que", "se", "sin", "su", "sus", "un",
+    "una", "unos", "unas", "y", "o", "e", "le", "les", "mas", "tras",
+    "hoy", "ya",
+    # Términos regionales que aparecen en casi todos los títulos
+    "san", "luis", "rio", "colorado", "slrc", "sonora", "sanluisino",
+    "sanluisinos", "sanluisina", "sanluisinas"
+}
+
+
+def tokens_distintivos(texto):
+    return {
+        palabra
+        for palabra in limpiar_texto(texto).split()
+        if palabra not in PALABRAS_IGNORAR
+    }
+
+
 def titulo_parecido(t1, t2):
+    """
+    Antes: SequenceMatcher >= 0.80 sobre el título completo.
+    Problema: "San Luis Río Colorado" ocupa ~40 % del título, por lo que
+    noticias DISTINTAS daban ratio 0.85-0.98 y se descartaban como
+    "ya enviadas".
+
+    Ahora: Jaccard sobre palabras distintivas.
+    """
     a = limpiar_texto(t1)
     b = limpiar_texto(t2)
 
     if not a or not b:
         return False
 
-    return (
-        SequenceMatcher(None, a, b).ratio()
-        >= UMBRAL_SIMILITUD_TITULO
-    )
+    if a == b:
+        return True
+
+    ta = tokens_distintivos(a)
+    tb = tokens_distintivos(b)
+    union = ta | tb
+
+    if len(union) < MIN_TOKENS_COMPARABLES:
+        # Muy pocas palabras útiles: solo casi idénticos.
+        return SequenceMatcher(None, a, b).ratio() >= 0.95
+
+    return len(ta & tb) / len(union) >= UMBRAL_SIMILITUD_TITULO
 
 
 def es_url_http(url):
@@ -176,186 +225,196 @@ def es_url_http(url):
 # ============================================================
 # HISTORIAL
 # ============================================================
+#
+# Formato de noticias_enviadas.json: una LISTA de registros.
+#
+#   [
+#     {
+#       "titulo": "Titular de la noticia",
+#       "link": "https://...",
+#       "link_original": "https://...",   (solo si hubo redirección)
+#       "fuente": "Tribuna de San Luis - Local",
+#       "enviada": "2026-11-23T04:00:12-07:00"
+#     }
+#   ]
+#
+# Para borrar el historial basta con dejar el archivo así:  []
+# (También funciona borrar el archivo o dejarlo vacío.)
+#
+# Si se encuentra el formato anterior ({"links": [...], "titulos": [...]})
+# se migra automáticamente al nuevo formato en el primer guardado.
+# ============================================================
 
-def historial_vacio():
-    return {
-        "ultima_ejecucion": None,
-        "ultimo_total_encontrado": 0,
-        "ultimo_total_enviado": 0,
-        "links": [],
-        "titulos": []
+def normalizar_registro(item):
+    """Convierte cualquier entrada válida en un dict de registro, o None."""
+    if isinstance(item, str):
+        # Tolerancia: una lista simple de URLs ["https://...", ...]
+        return {"link": item} if es_url_http(item) else {"titulo": item}
+
+    if not isinstance(item, dict):
+        return None
+
+    registro = {
+        clave: str(item[clave]).strip()
+        for clave in ("titulo", "link", "link_original", "fuente", "enviada")
+        if item.get(clave)
     }
+
+    if not registro.get("link") and not registro.get("titulo"):
+        return None
+
+    return registro
+
+
+def migrar_formato_anterior(data):
+    """{"links": [...], "titulos": [...]} -> lista de registros."""
+    registros = []
+
+    for link in data.get("links") or []:
+        if isinstance(link, str) and link:
+            registros.append({"link": link})
+
+    for titulo in data.get("titulos") or []:
+        if isinstance(titulo, str) and titulo:
+            registros.append({"titulo": titulo})
+
+    log.warning(
+        "Historial en formato anterior detectado; se migra a lista "
+        f"({len(registros)} registros)."
+    )
+    return registros
+
+
+def respaldar_archivo_danado():
+    try:
+        respaldo = f"{ARCHIVO_ENVIADAS}.bak_{int(time.time())}"
+        os.replace(ARCHIVO_ENVIADAS, respaldo)
+        log.warning(f"Historial respaldado como {respaldo}")
+    except OSError:
+        pass
 
 
 def cargar_enviadas():
+    """Devuelve siempre una lista de registros (posiblemente vacía)."""
     if not os.path.exists(ARCHIVO_ENVIADAS):
-        return historial_vacio()
+        return []
 
     try:
-        with open(
-            ARCHIVO_ENVIADAS,
-            "r",
-            encoding="utf-8"
-        ) as archivo:
-            data = json.load(archivo)
+        with open(ARCHIVO_ENVIADAS, "r", encoding="utf-8") as archivo:
+            contenido = archivo.read().strip()
 
-        if not isinstance(data, dict):
-            return historial_vacio()
+        if not contenido:
+            return []
 
-        base = historial_vacio()
-        base.update(data)
-
-        if not isinstance(base.get("links"), list):
-            base["links"] = []
-
-        if not isinstance(base.get("titulos"), list):
-            base["titulos"] = []
-
-        return base
+        data = json.loads(contenido)
 
     except Exception as error:
-        log.error(
-            f"Error leyendo historial: {error}"
-        )
+        log.error(f"Error leyendo historial: {error}")
+        respaldar_archivo_danado()
+        return []
 
-        try:
-            respaldo = (
-                f"{ARCHIVO_ENVIADAS}"
-                f".bak_{int(time.time())}"
-            )
+    if isinstance(data, dict):
+        data = migrar_formato_anterior(data)
 
-            os.replace(
-                ARCHIVO_ENVIADAS,
-                respaldo
-            )
+    if not isinstance(data, list):
+        log.error("Historial con estructura desconocida; se ignora.")
+        respaldar_archivo_danado()
+        return []
 
-            log.warning(
-                f"Historial respaldado como {respaldo}"
-            )
+    registros = []
+    for item in data:
+        registro = normalizar_registro(item)
+        if registro:
+            registros.append(registro)
 
-        except OSError:
-            pass
-
-        return historial_vacio()
+    return registros
 
 
-def guardar_enviadas_en_disco(historial):
-    historial["links"] = (
-        historial.get("links", [])[-MAX_HISTORIAL:]
-    )
-
-    historial["titulos"] = (
-        historial.get("titulos", [])[-MAX_HISTORIAL:]
-    )
-
+def guardar_enviadas_en_disco(registros):
+    registros = registros[-MAX_HISTORIAL:]
     temporal = ARCHIVO_ENVIADAS + ".tmp"
 
-    with open(
-        temporal,
-        "w",
-        encoding="utf-8"
-    ) as archivo:
-        json.dump(
-            historial,
-            archivo,
-            ensure_ascii=False,
-            indent=2
-        )
+    with open(temporal, "w", encoding="utf-8") as archivo:
+        json.dump(registros, archivo, ensure_ascii=False, indent=2)
         archivo.write("\n")
 
-    os.replace(
-        temporal,
-        ARCHIVO_ENVIADAS
-    )
+    os.replace(temporal, ARCHIVO_ENVIADAS)
 
 
 class Historial:
 
     def __init__(self):
-        data = cargar_enviadas()
+        # Lista ordenada (más antiguo -> más reciente).
+        self.registros = cargar_enviadas()
+        self._reindexar()
 
-        self.links = set(
-            data["links"]
-        )
+        log.info(f"Historial cargado: {len(self.registros)} registros")
 
-        self.titulos = list(
-            data["titulos"]
-        )
+    def _reindexar(self):
+        self.links = set()
+        self.titulos = []
 
-        self.ultima_ejecucion = data.get(
-            "ultima_ejecucion"
-        )
+        for registro in self.registros:
+            for clave in ("link", "link_original"):
+                if registro.get(clave):
+                    self.links.add(registro[clave])
 
-        self.ultimo_total_encontrado = data.get(
-            "ultimo_total_encontrado",
-            0
-        )
-
-        self.ultimo_total_enviado = data.get(
-            "ultimo_total_enviado",
-            0
-        )
+            if registro.get("titulo"):
+                self.titulos.append(registro["titulo"])
 
     def ya_fue_enviada(self, noticia):
         if noticia["link"] in self.links:
             return True
 
+        if noticia.get("link_original") in self.links:
+            return True
+
         return any(
-            titulo_parecido(
-                noticia["titulo"],
-                titulo_guardado
-            )
-            for titulo_guardado in self.titulos
+            titulo_parecido(noticia["titulo"], titulo_guardado)
+            for titulo_guardado in self.titulos[-MAX_TITULOS_COMPARAR:]
         )
 
     def registrar(self, noticia):
-        self.links.add(
-            noticia["link"]
-        )
+        registro = {
+            "titulo": noticia["titulo"],
+            "link": noticia["link"],
+            "fuente": noticia.get("fuente"),
+            "enviada": datetime.now(TZ).isoformat(timespec="seconds")
+        }
 
-        if noticia["titulo"] not in self.titulos:
-            self.titulos.append(
-                noticia["titulo"]
-            )
+        if (
+            noticia.get("link_original")
+            and noticia["link_original"] != noticia["link"]
+        ):
+            registro["link_original"] = noticia["link_original"]
 
-    def guardar(
-        self,
-        encontrados=None,
-        enviados=None
-    ):
-        if encontrados is not None:
-            self.ultimo_total_encontrado = encontrados
+        registro = normalizar_registro(registro)
+        self.registros.append(registro)
 
-        if enviados is not None:
-            self.ultimo_total_enviado = enviados
+        self.links.add(registro["link"])
+        if registro.get("link_original"):
+            self.links.add(registro["link_original"])
+        self.titulos.append(registro["titulo"])
 
-        self.ultima_ejecucion = (
-            datetime.now(TZ).isoformat()
-        )
+    def guardar(self, encontrados=None, enviados=None):
+        """
+        Las estadísticas de la corrida (encontrados/enviados) ya no se
+        guardan en el JSON para que el archivo sea una lista pura;
+        solo se registran en el log.
+        """
+        if DRY_RUN:
+            return
 
-        guardar_enviadas_en_disco({
-            "ultima_ejecucion":
-                self.ultima_ejecucion,
+        guardar_enviadas_en_disco(self.registros)
 
-            "ultimo_total_encontrado":
-                self.ultimo_total_encontrado,
-
-            "ultimo_total_enviado":
-                self.ultimo_total_enviado,
-
-            "links":
-                list(self.links),
-
-            "titulos":
-                self.titulos
-        })
+        extra = ""
+        if encontrados is not None or enviados is not None:
+            extra = f" | encontradas={encontrados}, enviadas={enviados}"
 
         log.info(
-            f"Historial guardado: "
-            f"{len(self.links)} links, "
-            f"{len(self.titulos)} títulos"
+            f"Historial guardado: {len(self.registros[-MAX_HISTORIAL:])} registros"
+            f"{extra}"
         )
-
 
 # ============================================================
 # FILTRO GEOGRÁFICO
@@ -976,13 +1035,30 @@ def obtener_metadatos_articulo(
 
         response.raise_for_status()
 
-        # Guardamos la URL final tras redirecciones.
+        # Guardamos la URL final tras redirecciones (y la original,
+        # para que ambas queden en el historial).
+        noticia["link_original"] = link
         noticia["link"] = response.url
 
         soup = BeautifulSoup(
             response.text,
             "html.parser"
         )
+
+        # El texto del <a> en la portada puede traer ruido
+        # (sección, hora, resumen). og:title es el título real.
+        og_title = obtener_meta_content(
+            soup,
+            property_name="og:title"
+        )
+
+        if og_title and len(og_title) >= 15:
+            noticia["titulo"] = re.sub(
+                r"\s*[|\-–]\s*(Tribuna de San Luis|El Imparcial).*$",
+                "",
+                og_title.strip(),
+                flags=re.I
+            )
 
         noticia["fecha"] = (
             extraer_fecha_desde_soup(
@@ -1138,12 +1214,47 @@ def parece_articulo(link):
     return False
 
 
+def texto_del_enlace(item):
+    """Texto visible del <a>; si es corto, usa title/aria-label/alt."""
+    texto = item.get_text(" ", strip=True)
+
+    if len(texto) >= 20:
+        return texto
+
+    alternativas = [
+        item.get("title"),
+        item.get("aria-label")
+    ]
+
+    img = item.find("img")
+
+    if img:
+        alternativas.append(img.get("alt"))
+
+    for alt in alternativas:
+        if alt and len(alt.strip()) >= 20:
+            return alt.strip()
+
+    return texto
+
+
 def obtener_noticias(
     historial
 ):
     candidatas = []
+    vistos_en_corrida = {}
 
     for fuente in FUENTES:
+
+        embudo = {
+            "anchors": 0,
+            "texto_corto": 0,
+            "no_articulo": 0,
+            "no_slrc": 0,
+            "repetido_en_corrida": 0,
+            "ya_enviada": 0,
+            "candidatas": 0
+        }
 
         try:
             log.info(
@@ -1174,24 +1285,17 @@ def obtener_noticias(
                 href=True
             )
 
+            embudo["anchors"] = len(links)
+
             for posicion, item in enumerate(
                 links
             ):
-                titulo = item.get_text(
-                    " ",
-                    strip=True
-                )
+                titulo = texto_del_enlace(item)
 
                 href = item.get(
                     "href",
                     ""
                 ).strip()
-
-                if (
-                    not titulo
-                    or len(titulo) < 20
-                ):
-                    continue
 
                 link = construir_url_absoluta(
                     response.url,
@@ -1201,15 +1305,39 @@ def obtener_noticias(
                 if not link:
                     continue
 
+                # Normalizar: sin query ni fragment (utm_*, #comentarios...).
+                p = urlparse(link)
+                link = f"{p.scheme}://{p.netloc}{p.path}"
+
                 if not parece_articulo(
                     link
                 ):
+                    embudo["no_articulo"] += 1
+                    continue
+
+                if (
+                    not titulo
+                    or len(titulo) < 20
+                ):
+                    embudo["texto_corto"] += 1
                     continue
 
                 if not es_noticia_slrc(
                     titulo,
                     link
                 ):
+                    embudo["no_slrc"] += 1
+                    if DEBUG:
+                        log.info(f"  [no_slrc] {titulo} -> {link}")
+                    continue
+
+                # Mismo link visto antes en esta corrida: conservar el
+                # título más largo (suele ser el titular completo).
+                if link in vistos_en_corrida:
+                    previa = vistos_en_corrida[link]
+                    if len(titulo) > len(previa["titulo"]):
+                        previa["titulo"] = titulo
+                    embudo["repetido_en_corrida"] += 1
                     continue
 
                 noticia = {
@@ -1221,13 +1349,31 @@ def obtener_noticias(
                         posicion
                 }
 
+                vistos_en_corrida[link] = noticia
+
                 if historial.ya_fue_enviada(
                     noticia
                 ):
+                    embudo["ya_enviada"] += 1
+                    if DEBUG:
+                        log.info(f"  [ya_enviada] {titulo} -> {link}")
                     continue
+
+                embudo["candidatas"] += 1
 
                 candidatas.append(
                     noticia
+                )
+
+            log.info(
+                f"Embudo {fuente['nombre']}: "
+                + ", ".join(f"{k}={v}" for k, v in embudo.items())
+            )
+
+            if embudo["candidatas"] == 0 and embudo["no_articulo"] == embudo["anchors"]:
+                log.warning(
+                    f"{fuente['nombre']}: ningún link pasó parece_articulo(). "
+                    "Posible cambio de estructura de URLs o contenido cargado por JavaScript."
                 )
 
         except requests.exceptions.RequestException as error:
@@ -1254,30 +1400,46 @@ def obtener_noticias(
     )
 
     noticias_finales = []
+    rechazadas_fecha = 0
+    rechazadas_tras_og_title = 0
 
-    for noticia in candidatas:
+    for noticia in candidatas[:MAX_CANDIDATAS_A_REVISAR]:
 
         obtener_metadatos_articulo(
             noticia
         )
+        time.sleep(0.3)
 
         if not fecha_aceptable(
             noticia.get("fecha")
         ):
+            rechazadas_fecha += 1
             log.info(
-                "Ignorada por fecha: "
+                "Ignorada por fecha "
+                f"({noticia.get('fecha')}): "
                 f"{noticia['titulo']}"
             )
+            continue
+
+        # El título pudo cambiar con og:title o el link con la redirección:
+        # revalidar contra historial y contra lo ya aceptado.
+        if historial.ya_fue_enviada(noticia) or any(
+            noticia["link"] == n["link"]
+            or titulo_parecido(noticia["titulo"], n["titulo"])
+            for n in noticias_finales
+        ):
+            rechazadas_tras_og_title += 1
             continue
 
         noticias_finales.append(
             noticia
         )
 
-        if len(noticias_finales) >= MAX_CANDIDATAS_A_REVISAR:
-            break
-
-        time.sleep(0.3)
+    log.info(
+        f"Resultado: {len(noticias_finales)} aceptadas | "
+        f"{rechazadas_fecha} fuera de rango de fecha | "
+        f"{rechazadas_tras_og_title} duplicadas tras leer el artículo"
+    )
 
     # Priorizar artículos fechados recientemente; los sin fecha quedan al final.
     noticias_finales.sort(
@@ -1324,6 +1486,39 @@ def validar_respuesta_telegram(
     return True
 
 
+def post_telegram(url, data, files=None, timeout=30, intentos=3):
+    """POST a Telegram respetando 429 (retry_after)."""
+    for intento in range(1, intentos + 1):
+        if files:
+            # files = {"photo": (nombre, BytesIO, mime)}
+            for valor in files.values():
+                valor[1].seek(0)
+
+        response = requests.post(
+            url, data=data, files=files, timeout=timeout
+        )
+
+        if response.status_code != 429:
+            return response
+
+        try:
+            espera = int(
+                response.json()
+                .get("parameters", {})
+                .get("retry_after", 5)
+            )
+        except ValueError:
+            espera = 5
+
+        log.warning(
+            f"Telegram 429 (rate limit). Esperando {espera}s "
+            f"(intento {intento}/{intentos})"
+        )
+        time.sleep(espera + 1)
+
+    return response
+
+
 def enviar_mensaje(
     texto,
     mostrar_preview=False
@@ -1334,7 +1529,7 @@ def enviar_mensaje(
     )
 
     try:
-        response = requests.post(
+        response = post_telegram(
             url,
             data={
                 "chat_id": CHAT_ID,
@@ -1366,9 +1561,7 @@ def enviar_foto_subida(
     Telegram ya no necesita entrar al sitio del periódico.
     """
 
-    titulo = escapar_html(
-        noticia["titulo"]
-    )
+    titulo_crudo = noticia["titulo"]
 
     fuente = escapar_html(
         noticia["fuente"]
@@ -1378,11 +1571,20 @@ def enviar_foto_subida(
         noticia["link"]
     )
 
-    caption = (
-        f"<b>{titulo}</b>\n"
-        f"Fuente: {fuente}\n"
-        f'<a href="{link}">Abrir noticia</a>'
-    )
+    def armar_caption(t):
+        return (
+            f"<b>{escapar_html(t)}</b>\n"
+            f"Fuente: {fuente}\n"
+            f'<a href="{link}">Abrir noticia</a>'
+        )
+
+    caption = armar_caption(titulo_crudo)
+
+    # Telegram limita el caption a 1024 caracteres (de texto visible);
+    # recortamos el título con margen para no exceder el límite.
+    while len(caption) > LIMITE_CAPTION and len(titulo_crudo) > 40:
+        titulo_crudo = titulo_crudo[:len(titulo_crudo) - 50].rstrip() + "…"
+        caption = armar_caption(titulo_crudo)
 
     url = (
         "https://api.telegram.org/"
@@ -1392,7 +1594,7 @@ def enviar_foto_subida(
     try:
         imagen_jpeg.seek(0)
 
-        response = requests.post(
+        response = post_telegram(
             url,
             data={
                 "chat_id": CHAT_ID,
@@ -1491,6 +1693,17 @@ def enviar_noticia(
 # ============================================================
 
 def main():
+    if DRY_RUN:
+        log.info("=== DRY_RUN: no se envía nada ni se modifica el historial ===")
+        noticias = obtener_noticias(Historial())
+        for i, n in enumerate(noticias, 1):
+            marca = "ENVIARÍA" if i <= MAX_NOTICIAS_POR_CORRIDA else "excede límite"
+            log.info(
+                f"{i:02d}. [{marca}] {n.get('fecha')} | {n['fuente']} | "
+                f"{n['titulo']} | img={'sí' if n.get('imagen') else 'no'}"
+            )
+        return
+
     if not TOKEN:
         log.error(
             "Falta configurar TOKEN."
