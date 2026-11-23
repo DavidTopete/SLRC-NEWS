@@ -108,6 +108,23 @@ FUENTES = [
         "requiere_mencion": True
     },
     {
+        # Verificado 23/11/2026: ~10 notas de SLRC en el HTML.
+        # Su robots.txt prohíbe /rss, por eso se lee la página HTML.
+        "nombre": "Meganoticias SLRC",
+        "tipo": "html",
+        "url": "https://www.meganoticias.mx/s-luis-r-colorado"
+    },
+    {
+        # Boletines oficiales del Ayuntamiento (RSS WordPress, 10 notas).
+        # Si no quieres boletines de gobierno, elimina este bloque.
+        "nombre": "Ayuntamiento SLRC",
+        "tipo": "rss",
+        "url": "https://sanluisrc.gob.mx/categoria/noticias/feed/",
+        "requiere_mencion": False
+    },
+    {
+        # OEM bloquea muchos accesos automatizados (403). Se mantiene
+        # por si desde tu servidor sí responde.
         "nombre": "Tribuna de San Luis",
         "tipo": "html",
         "url": "https://oem.com.mx/tribunadesanluis/"
@@ -284,6 +301,11 @@ def clave_articulo(link):
         m = re.search(r"-(\d{5,})$", ruta)
         if m:
             return f"oem:{m.group(1)}"
+
+    if dominio.endswith("meganoticias.mx"):
+        m = re.search(r"/noticia/[^/]+/(\d+)$", ruta)
+        if m:
+            return f"meganoticias:{m.group(1)}"
 
     if dominio.endswith("elimparcial.com") and ultimo:
         return f"elimparcial:{ultimo}"
@@ -514,6 +536,8 @@ def es_noticia_slrc(titulo, link, requiere_mencion=False):
     seccion_local = (
         ("elimparcial.com" in dominio and "/mxl/sanluis/" in ruta)
         or ("oem.com.mx" in dominio and "/tribunadesanluis/" in ruta)
+        or ("meganoticias.mx" in dominio and "/s-luis-r-colorado/" in ruta)
+        or ("sanluisrc.gob.mx" in dominio)
     )
     otras_ciudades = (
         "hermosillo", "nogales", "guaymas", "ciudad obregon",
@@ -562,7 +586,9 @@ def convertir_fecha(fecha_texto):
 
     formatos = [
         "%Y-%m-%d",
-        "%d/%m/%Y"
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%d/%m/%Y %H:%M"
     ]
 
     for formato in formatos:
@@ -634,6 +660,20 @@ def extraer_fecha_desde_soup(soup):
 
             if fecha:
                 return fecha
+
+    # <time datetime="...">
+    for nodo in soup.find_all("time", attrs={"datetime": True}):
+        fecha = convertir_fecha(nodo.get("datetime"))
+        if fecha:
+            return fecha
+
+    # Fecha visible con etiqueta, p. ej. Meganoticias: "Fecha: 23-11-2026"
+    texto_pagina = soup.get_text(" ", strip=True)
+    m = re.search(r"Fecha:\s*(\d{1,2}[-/]\d{1,2}[-/]\d{4})", texto_pagina)
+    if m:
+        fecha = convertir_fecha(m.group(1).replace("/", "-"))
+        if fecha:
+            return fecha
 
     return None
 
@@ -1274,6 +1314,15 @@ def parece_articulo(link):
         # Algunos artículos nuevos pueden usar un formato distinto de ID.
         return len(path.rstrip("/").split("/")) >= 4 and len(path.rstrip("/").split("/")[-1]) > 25
 
+    # Meganoticias: /s-luis-r-colorado/noticia/<slug>/<id>
+    if "meganoticias.mx" in link:
+        return bool(re.search(r"/s-luis-r-colorado/noticia/[^/]+/\d+$", path.rstrip("/")))
+
+    # Ayuntamiento (WordPress): /<slug-largo>/
+    if "sanluisrc.gob.mx" in link:
+        segmentos = [x for x in path.split("/") if x]
+        return len(segmentos) == 1 and len(segmentos[0]) > 25
+
     # Para El Imparcial, las notas de San Luis usan /mxl/sanluis/YYYY/MM/DD/...
     if "elimparcial.com" in link:
         if re.search(
@@ -1397,7 +1446,16 @@ def imagen_de_item_rss(item):
 
     enclosure = item.find("enclosure")
     if enclosure is not None and "image" in (enclosure.get("type") or ""):
-        return (enclosure.get("url") or "").strip() or None
+        url = (enclosure.get("url") or "").strip()
+        if url:
+            return url
+
+    # WordPress: primera <img> dentro de content:encoded o description.
+    for etiqueta in ("{http://purl.org/rss/1.0/modules/content/}encoded", "description"):
+        html = item.findtext(etiqueta) or ""
+        m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html, flags=re.I)
+        if m and parece_imagen_util(m.group(1)):
+            return m.group(1).strip()
 
     return None
 
