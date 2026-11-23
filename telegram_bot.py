@@ -50,7 +50,18 @@ DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 LIMITE_CAPTION = 1024
-MAX_NOTICIAS_POR_CORRIDA = 10
+# Cupo por medio en cada corrida (total = suma de cupos).
+# Las notas se toman de la más reciente a la más antigua dentro de cada medio.
+CUPO_POR_MEDIO = {
+    "Tribuna de San Luis": 5,
+    "El Imparcial": 5
+}
+
+# False -> cada medio manda como máximo su cupo, aunque el otro tenga menos.
+# True  -> si un medio no llena su cupo, el otro completa hasta el total.
+RELLENAR_CUPO_VACIO = False
+
+MAX_NOTICIAS_POR_CORRIDA = sum(CUPO_POR_MEDIO.values())
 MAX_CANDIDATAS_A_REVISAR = 80
 DIAS_RETROCESO = 7
 
@@ -82,6 +93,7 @@ MAX_IMAGE_BYTES = 18 * 1024 * 1024
 FUENTES = [
     {
         "nombre": "El Imparcial San Luis",
+        "medio": "El Imparcial",
         "tipo": "rss",
         "url": (
             "https://www.elimparcial.com/arc/outboundfeeds/rss/"
@@ -91,6 +103,7 @@ FUENTES = [
     },
     {
         "nombre": "El Imparcial Sonora",
+        "medio": "El Imparcial",
         "tipo": "rss",
         "url": (
             "https://www.elimparcial.com/arc/outboundfeeds/rss/"
@@ -100,6 +113,7 @@ FUENTES = [
     },
     {
         "nombre": "El Imparcial",
+        "medio": "El Imparcial",
         "tipo": "rss",
         "url": (
             "https://www.elimparcial.com/arc/outboundfeeds/rss/"
@@ -108,44 +122,34 @@ FUENTES = [
         "requiere_mencion": True
     },
     {
-        # Verificado 23/11/2026: ~10 notas de SLRC en el HTML.
-        # Su robots.txt prohíbe /rss, por eso se lee la página HTML.
-        "nombre": "Meganoticias SLRC",
-        "tipo": "html",
-        "url": "https://www.meganoticias.mx/s-luis-r-colorado"
-    },
-    {
-        # Boletines oficiales del Ayuntamiento (RSS WordPress, 10 notas).
-        # Si no quieres boletines de gobierno, elimina este bloque.
-        "nombre": "Ayuntamiento SLRC",
-        "tipo": "rss",
-        "url": "https://sanluisrc.gob.mx/categoria/noticias/feed/",
-        "requiere_mencion": False
-    },
-    {
         # OEM bloquea muchos accesos automatizados (403). Se mantiene
         # por si desde tu servidor sí responde.
         "nombre": "Tribuna de San Luis",
+        "medio": "Tribuna de San Luis",
         "tipo": "html",
         "url": "https://oem.com.mx/tribunadesanluis/"
     },
     {
         "nombre": "Tribuna de San Luis - Local",
+        "medio": "Tribuna de San Luis",
         "tipo": "html",
         "url": "https://oem.com.mx/tribunadesanluis/local/"
     },
     {
         "nombre": "Tribuna de San Luis - Policiaca",
+        "medio": "Tribuna de San Luis",
         "tipo": "html",
         "url": "https://oem.com.mx/tribunadesanluis/policiaca/"
     },
     {
         "nombre": "Tribuna de San Luis - Deportes",
+        "medio": "Tribuna de San Luis",
         "tipo": "html",
         "url": "https://oem.com.mx/tribunadesanluis/deportes/"
     },
     {
         "nombre": "Tribuna de San Luis - San Luis Río Colorado",
+        "medio": "Tribuna de San Luis",
         "tipo": "html",
         "url": (
             "https://oem.com.mx/tribunadesanluis/"
@@ -1420,6 +1424,7 @@ def leer_fuente_html(fuente, embudo):
             "titulo": titulo,
             "link": link,
             "fuente": fuente["nombre"],
+            "medio": fuente.get("medio", fuente["nombre"]),
             "posicion": posicion,
             "fecha": None,
             "imagen": None
@@ -1513,6 +1518,7 @@ def leer_fuente_rss(fuente, embudo):
             "titulo": titulo,
             "link": link,
             "fuente": fuente["nombre"],
+            "medio": fuente.get("medio", fuente["nombre"]),
             "posicion": posicion,
             "fecha": fecha,
             "imagen": imagen_de_item_rss(item)
@@ -1531,7 +1537,11 @@ def obtener_noticias(historial):
     # 1) Recolectar de todas las fuentes, deduplicando por ID de artículo.
     por_clave = {}
 
-    for fuente in FUENTES:
+    for indice, fuente in enumerate(FUENTES):
+        # robots.txt de oem.com.mx pide Crawl-delay: 2
+        if indice:
+            time.sleep(2)
+
         embudo = nuevo_embudo()
         lector = lectores.get(fuente.get("tipo", "html"), leer_fuente_html)
 
@@ -1632,13 +1642,55 @@ def obtener_noticias(historial):
         f"{duplicadas} duplicadas"
     )
 
-    if len(finales) < MAX_NOTICIAS_POR_CORRIDA:
-        log.warning(
-            f"Solo hay {len(finales)} noticias nuevas (objetivo: "
-            f"{MAX_NOTICIAS_POR_CORRIDA}). Revisa los embudos de arriba."
-        )
+    for medio, cupo in CUPO_POR_MEDIO.items():
+        disponibles = sum(1 for n in finales if n.get("medio") == medio)
+        if disponibles < cupo:
+            log.warning(
+                f"{medio}: solo {disponibles} noticias nuevas disponibles "
+                f"(cupo: {cupo}). Revisa su embudo arriba."
+            )
+        else:
+            log.info(f"{medio}: {disponibles} noticias nuevas disponibles (cupo: {cupo})")
 
     return finales
+
+
+def puede_enviar(medio, conteo_por_medio, total_enviadas, disponibles_por_medio):
+    """Decide si todavía cabe una nota de este medio en la corrida."""
+    if total_enviadas >= MAX_NOTICIAS_POR_CORRIDA:
+        return False
+
+    cupo = CUPO_POR_MEDIO.get(medio, 0)
+    usados = conteo_por_medio.get(medio, 0)
+
+    if usados < cupo:
+        return True
+
+    if not RELLENAR_CUPO_VACIO:
+        return False
+
+    # Rellenar: solo si algún otro medio ya no puede llenar su cupo.
+    espacio_libre = sum(
+        max(0, c - max(conteo_por_medio.get(m, 0), disponibles_por_medio.get(m, 0)))
+        for m, c in CUPO_POR_MEDIO.items() if m != medio
+    )
+    extra_usado = sum(
+        max(0, conteo_por_medio.get(m, 0) - c) for m, c in CUPO_POR_MEDIO.items()
+    )
+    return extra_usado < espacio_libre
+
+
+def seleccionar_por_cupo(noticias):
+    """Vista previa (DRY_RUN) de lo que se enviaría respetando los cupos."""
+    conteo, seleccion = {}, []
+    disponibles = {}
+    for n in noticias:
+        disponibles[n.get("medio")] = disponibles.get(n.get("medio"), 0) + 1
+    for n in noticias:
+        if puede_enviar(n.get("medio"), conteo, len(seleccion), disponibles):
+            conteo[n.get("medio")] = conteo.get(n.get("medio"), 0) + 1
+            seleccion.append(n)
+    return seleccion
 
 
 # ============================================================
@@ -1888,10 +1940,11 @@ def main():
     if DRY_RUN:
         log.info("=== DRY_RUN: no se envía nada ni se modifica el historial ===")
         noticias = obtener_noticias(Historial())
+        elegidas = {id(n) for n in seleccionar_por_cupo(noticias)}
         for i, n in enumerate(noticias, 1):
-            marca = "ENVIARÍA" if i <= MAX_NOTICIAS_POR_CORRIDA else "excede límite"
+            marca = "ENVIARÍA" if id(n) in elegidas else "fuera de cupo"
             log.info(
-                f"{i:02d}. [{marca}] {n.get('fecha')} | {n['fuente']} | "
+                f"{i:02d}. [{marca}] {n.get('fecha')} | {n.get('medio')} | "
                 f"{n['titulo']} | img={'sí' if n.get('imagen') else 'no'}"
             )
         return
@@ -1970,10 +2023,24 @@ def main():
     total_fallidas = 0
 
     claves_enviadas_corrida = set()
+    conteo_por_medio = {}
+    disponibles_por_medio = {}
+    for n in noticias_a_enviar:
+        disponibles_por_medio[n.get("medio")] = disponibles_por_medio.get(n.get("medio"), 0) + 1
 
     for noticia in noticias_a_enviar:
         if total_enviadas >= MAX_NOTICIAS_POR_CORRIDA:
             break
+
+        # Cupo por medio (5 Tribuna + 5 El Imparcial). Si una nota falla,
+        # la siguiente del mismo medio ocupa su lugar.
+        if not puede_enviar(
+            noticia.get("medio"),
+            conteo_por_medio,
+            total_enviadas,
+            disponibles_por_medio
+        ):
+            continue
 
         # Doble seguro anti-repetición dentro de la misma corrida.
         if (
@@ -1988,6 +2055,9 @@ def main():
 
         if enviado:
             claves_enviadas_corrida.add(noticia["clave"])
+            conteo_por_medio[noticia.get("medio")] = (
+                conteo_por_medio.get(noticia.get("medio"), 0) + 1
+            )
             historial.registrar(
                 noticia
             )
@@ -2018,6 +2088,11 @@ def main():
             noticias_a_enviar
         ),
         enviados=total_enviadas
+    )
+
+    log.info(
+        "Enviadas por medio: "
+        + ", ".join(f"{m}={conteo_por_medio.get(m, 0)}/{c}" for m, c in CUPO_POR_MEDIO.items())
     )
 
     log.info(
