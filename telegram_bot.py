@@ -11,6 +11,8 @@ import os
 import re
 import logging
 from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
+import xml.etree.ElementTree as ET
 
 
 # ============================================================
@@ -35,7 +37,7 @@ TZ = ZoneInfo("America/Hermosillo")
 
 # Similitud de títulos: se calcula sobre palabras DISTINTIVAS (sin
 # stopwords ni "San Luis Río Colorado"), con índice de Jaccard.
-UMBRAL_SIMILITUD_TITULO = 0.80
+UMBRAL_SIMILITUD_TITULO = 0.85
 MIN_TOKENS_COMPARABLES = 3
 # Solo se comparan títulos contra los N más recientes del historial
 # (la deduplicación por link sigue usando el historial completo).
@@ -64,40 +66,74 @@ MAX_IMAGE_BYTES = 18 * 1024 * 1024
 # FUENTES
 # ============================================================
 #
-# IMPORTANTE:
-# El Imparcial ya publica la sección de San Luis bajo /mxl/sanluis/
-# y no bajo la URL antigua /sonora/sanluisriocolorado/.
+# tipo = "rss"  -> feed RSS (preferido: trae fecha exacta, título limpio
+#                  e imagen; no depende de JavaScript).
+# tipo = "html" -> se leen los <a> de la página (respaldo).
 #
-# Tribuna se consulta mediante páginas que contienen noticias locales.
+# requiere_mencion = True -> solo se aceptan notas cuyo título mencione
+#                            SLRC (para feeds generales / estatales).
+#
+# Verificado 23/11/2026:
+#   - El Imparcial /mxl/sanluis/ (HTML) solo trae ~6 enlaces en el HTML;
+#     el listado se carga por JavaScript -> casi 0 notas. Se reemplaza
+#     por su feed RSS de sección, que sí trae las notas de SLRC.
 # ============================================================
 
 FUENTES = [
     {
+        "nombre": "El Imparcial San Luis",
+        "tipo": "rss",
+        "url": (
+            "https://www.elimparcial.com/arc/outboundfeeds/rss/"
+            "category/mxl/sanluis/?outputType=xml"
+        ),
+        "requiere_mencion": False
+    },
+    {
+        "nombre": "El Imparcial Sonora",
+        "tipo": "rss",
+        "url": (
+            "https://www.elimparcial.com/arc/outboundfeeds/rss/"
+            "category/son/sonora/?outputType=xml"
+        ),
+        "requiere_mencion": True
+    },
+    {
+        "nombre": "El Imparcial",
+        "tipo": "rss",
+        "url": (
+            "https://www.elimparcial.com/arc/outboundfeeds/rss/"
+            "?outputType=xml"
+        ),
+        "requiere_mencion": True
+    },
+    {
         "nombre": "Tribuna de San Luis",
+        "tipo": "html",
         "url": "https://oem.com.mx/tribunadesanluis/"
     },
     {
         "nombre": "Tribuna de San Luis - Local",
+        "tipo": "html",
         "url": "https://oem.com.mx/tribunadesanluis/local/"
     },
     {
         "nombre": "Tribuna de San Luis - Policiaca",
+        "tipo": "html",
         "url": "https://oem.com.mx/tribunadesanluis/policiaca/"
     },
     {
         "nombre": "Tribuna de San Luis - Deportes",
+        "tipo": "html",
         "url": "https://oem.com.mx/tribunadesanluis/deportes/"
     },
     {
         "nombre": "Tribuna de San Luis - San Luis Río Colorado",
+        "tipo": "html",
         "url": (
             "https://oem.com.mx/tribunadesanluis/"
             "tags/temas/san-luis-rio-colorado/"
         )
-    },
-    {
-        "nombre": "El Imparcial San Luis",
-        "url": "https://www.elimparcial.com/mxl/sanluis/"
     }
 ]
 
@@ -222,6 +258,39 @@ def es_url_http(url):
     )
 
 
+def clave_articulo(link):
+    """
+    Identificador estable de un artículo, independiente de:
+      - http / https, www, mayúsculas
+      - query string (?utm=...), #fragmento, "/" final
+      - sección en la URL (Tribuna publica la misma nota bajo
+        /local/... y /policiaca/... con el mismo ID numérico)
+
+    Ejemplos:
+      https://oem.com.mx/tribunadesanluis/local/titulo-12345678
+          -> "oem:12345678"
+      https://www.elimparcial.com/mxl/sanluis/2026/11/22/titulo/
+          -> "elimparcial:titulo"
+    """
+    if not link:
+        return None
+
+    p = urlparse(str(link).strip())
+    dominio = p.netloc.lower().removeprefix("www.")
+    ruta = p.path.lower().rstrip("/")
+    ultimo = ruta.rsplit("/", 1)[-1]
+
+    if dominio.endswith("oem.com.mx"):
+        m = re.search(r"-(\d{5,})$", ruta)
+        if m:
+            return f"oem:{m.group(1)}"
+
+    if dominio.endswith("elimparcial.com") and ultimo:
+        return f"elimparcial:{ultimo}"
+
+    return f"{dominio}{ruta}" if dominio else None
+
+
 # ============================================================
 # HISTORIAL
 # ============================================================
@@ -233,6 +302,7 @@ def es_url_http(url):
 #       "titulo": "Titular de la noticia",
 #       "link": "https://...",
 #       "link_original": "https://...",   (solo si hubo redirección)
+#       "clave": "oem:12345678",          (ID estable del artículo)
 #       "fuente": "Tribuna de San Luis - Local",
 #       "enviada": "2026-11-23T04:00:12-07:00"
 #     }
@@ -256,12 +326,15 @@ def normalizar_registro(item):
 
     registro = {
         clave: str(item[clave]).strip()
-        for clave in ("titulo", "link", "link_original", "fuente", "enviada")
+        for clave in ("titulo", "link", "link_original", "clave", "fuente", "enviada")
         if item.get(clave)
     }
 
     if not registro.get("link") and not registro.get("titulo"):
         return None
+
+    if registro.get("link") and not registro.get("clave"):
+        registro["clave"] = clave_articulo(registro["link"])
 
     return registro
 
@@ -351,23 +424,25 @@ class Historial:
         log.info(f"Historial cargado: {len(self.registros)} registros")
 
     def _reindexar(self):
-        self.links = set()
+        self.claves = set()
         self.titulos = []
 
         for registro in self.registros:
-            for clave in ("link", "link_original"):
-                if registro.get(clave):
-                    self.links.add(registro[clave])
+            for campo in ("link", "link_original"):
+                clave = clave_articulo(registro.get(campo))
+                if clave:
+                    self.claves.add(clave)
+
+            if registro.get("clave"):
+                self.claves.add(registro["clave"])
 
             if registro.get("titulo"):
                 self.titulos.append(registro["titulo"])
 
     def ya_fue_enviada(self, noticia):
-        if noticia["link"] in self.links:
-            return True
-
-        if noticia.get("link_original") in self.links:
-            return True
+        for campo in ("link", "link_original"):
+            if clave_articulo(noticia.get(campo)) in self.claves:
+                return True
 
         return any(
             titulo_parecido(noticia["titulo"], titulo_guardado)
@@ -388,12 +463,15 @@ class Historial:
         ):
             registro["link_original"] = noticia["link_original"]
 
+        registro["clave"] = clave_articulo(noticia["link"])
+
         registro = normalizar_registro(registro)
         self.registros.append(registro)
 
-        self.links.add(registro["link"])
-        if registro.get("link_original"):
-            self.links.add(registro["link_original"])
+        for campo in ("link", "link_original"):
+            clave = clave_articulo(registro.get(campo))
+            if clave:
+                self.claves.add(clave)
         self.titulos.append(registro["titulo"])
 
     def guardar(self, encontrados=None, enviados=None):
@@ -420,7 +498,7 @@ class Historial:
 # FILTRO GEOGRÁFICO
 # ============================================================
 
-def es_noticia_slrc(titulo, link):
+def es_noticia_slrc(titulo, link, requiere_mencion=False):
     """Acepta noticias de la sección local y referencias explícitas a SLRC."""
     texto_titulo = limpiar_texto(titulo)
     url = urlparse(link)
@@ -444,6 +522,8 @@ def es_noticia_slrc(titulo, link):
     )
     if any(ciudad in texto_titulo for ciudad in otras_ciudades) and not menciona_region:
         return False
+    if requiere_mencion:
+        return menciona_region
     return menciona_region or seccion_local
 
 
@@ -1238,215 +1318,269 @@ def texto_del_enlace(item):
     return texto
 
 
-def obtener_noticias(
-    historial
-):
-    candidatas = []
-    vistos_en_corrida = {}
+def nuevo_embudo():
+    return {
+        "items": 0,
+        "texto_corto": 0,
+        "no_articulo": 0,
+        "no_slrc": 0,
+        "aceptadas": 0
+    }
+
+
+def leer_fuente_html(fuente, embudo):
+    response = SESSION.get(fuente["url"], timeout=20, allow_redirects=True)
+
+    if response.status_code != 200:
+        log.warning(f"{fuente['nombre']} respondió HTTP {response.status_code}")
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    enlaces = soup.find_all("a", href=True)
+    embudo["items"] = len(enlaces)
+    noticias = []
+
+    for posicion, item in enumerate(enlaces):
+        link = construir_url_absoluta(response.url, item.get("href", ""))
+
+        if not link:
+            continue
+
+        # Sin query ni fragment (utm_*, #comentarios...).
+        p = urlparse(link)
+        link = f"{p.scheme}://{p.netloc}{p.path}"
+
+        if not parece_articulo(link):
+            embudo["no_articulo"] += 1
+            continue
+
+        titulo = texto_del_enlace(item)
+
+        if len(titulo) < 20:
+            embudo["texto_corto"] += 1
+            continue
+
+        if not es_noticia_slrc(titulo, link, fuente.get("requiere_mencion", False)):
+            embudo["no_slrc"] += 1
+            if DEBUG:
+                log.info(f"  [no_slrc] {titulo} -> {link}")
+            continue
+
+        embudo["aceptadas"] += 1
+        noticias.append({
+            "titulo": titulo,
+            "link": link,
+            "fuente": fuente["nombre"],
+            "posicion": posicion,
+            "fecha": None,
+            "imagen": None
+        })
+
+    if embudo["items"] and embudo["no_articulo"] == embudo["items"]:
+        log.warning(
+            f"{fuente['nombre']}: ningún link pasó parece_articulo(). "
+            "Posible cambio de URLs o contenido cargado por JavaScript."
+        )
+
+    return noticias
+
+
+def imagen_de_item_rss(item):
+    media = "{http://search.yahoo.com/mrss/}"
+
+    for etiqueta in (f"{media}content", f"{media}thumbnail"):
+        for nodo in item.iter(etiqueta):
+            url = nodo.get("url")
+            tipo = (nodo.get("type") or nodo.get("medium") or "image").lower()
+            if url and ("image" in tipo):
+                return url.strip()
+
+    enclosure = item.find("enclosure")
+    if enclosure is not None and "image" in (enclosure.get("type") or ""):
+        return (enclosure.get("url") or "").strip() or None
+
+    return None
+
+
+def leer_fuente_rss(fuente, embudo):
+    response = SESSION.get(
+        fuente["url"],
+        timeout=20,
+        allow_redirects=True,
+        headers={"Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8"}
+    )
+
+    if response.status_code != 200:
+        log.warning(f"{fuente['nombre']} respondió HTTP {response.status_code}")
+        return []
+
+    try:
+        raiz = ET.fromstring(response.content)
+    except ET.ParseError as error:
+        log.warning(f"{fuente['nombre']}: RSS inválido ({error})")
+        return []
+
+    items = list(raiz.iter("item"))
+    embudo["items"] = len(items)
+    noticias = []
+
+    for posicion, item in enumerate(items):
+        titulo = re.sub(r"\s+", " ", item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+
+        if not es_url_http(link):
+            embudo["no_articulo"] += 1
+            continue
+
+        if len(titulo) < 15:
+            embudo["texto_corto"] += 1
+            continue
+
+        if not es_noticia_slrc(titulo, link, fuente.get("requiere_mencion", False)):
+            embudo["no_slrc"] += 1
+            if DEBUG:
+                log.info(f"  [no_slrc] {titulo} -> {link}")
+            continue
+
+        fecha = None
+        pub = item.findtext("pubDate")
+        if pub:
+            try:
+                fecha = parsedate_to_datetime(pub.strip()).astimezone(TZ)
+            except (TypeError, ValueError):
+                fecha = convertir_fecha(pub)
+
+        embudo["aceptadas"] += 1
+        noticias.append({
+            "titulo": titulo,
+            "link": link,
+            "fuente": fuente["nombre"],
+            "posicion": posicion,
+            "fecha": fecha,
+            "imagen": imagen_de_item_rss(item)
+        })
+
+    return noticias
+
+
+def obtener_noticias(historial):
+    """
+    Devuelve las noticias NO enviadas, ordenadas de la más reciente
+    a la más antigua. main() envía las primeras MAX_NOTICIAS_POR_CORRIDA.
+    """
+    lectores = {"rss": leer_fuente_rss, "html": leer_fuente_html}
+
+    # 1) Recolectar de todas las fuentes, deduplicando por ID de artículo.
+    por_clave = {}
 
     for fuente in FUENTES:
-
-        embudo = {
-            "anchors": 0,
-            "texto_corto": 0,
-            "no_articulo": 0,
-            "no_slrc": 0,
-            "repetido_en_corrida": 0,
-            "ya_enviada": 0,
-            "candidatas": 0
-        }
+        embudo = nuevo_embudo()
+        lector = lectores.get(fuente.get("tipo", "html"), leer_fuente_html)
 
         try:
-            log.info(
-                f"Leyendo: "
-                f"{fuente['nombre']}"
-            )
+            log.info(f"Leyendo: {fuente['nombre']}")
+            noticias = lector(fuente, embudo)
+        except requests.exceptions.RequestException as error:
+            log.warning(f"Error de red en {fuente['nombre']}: {error}")
+            continue
+        except Exception as error:
+            log.exception(f"Error inesperado en {fuente['nombre']}: {error}")
+            continue
 
-            response = SESSION.get(
-                fuente["url"],
-                timeout=20,
-                allow_redirects=True
-            )
+        log.info(
+            f"Embudo {fuente['nombre']}: "
+            + ", ".join(f"{k}={v}" for k, v in embudo.items())
+        )
 
-            if response.status_code != 200:
-                log.warning(
-                    f"{fuente['nombre']} respondió "
-                    f"HTTP {response.status_code}"
-                )
+        for noticia in noticias:
+            clave = clave_articulo(noticia["link"])
+            noticia["clave"] = clave
+            previa = por_clave.get(clave)
+
+            if previa is None:
+                por_clave[clave] = noticia
                 continue
 
-            soup = BeautifulSoup(
-                response.text,
-                "html.parser"
-            )
+            # Misma nota en varias fuentes/páginas: completar datos.
+            if not previa.get("fecha") and noticia.get("fecha"):
+                previa["fecha"] = noticia["fecha"]
+            if not previa.get("imagen") and noticia.get("imagen"):
+                previa["imagen"] = noticia["imagen"]
+            # Si la previa vino de HTML (sin fecha), preferir el título más largo.
+            if not previa.get("fecha") and len(noticia["titulo"]) > len(previa["titulo"]):
+                previa["titulo"] = noticia["titulo"]
 
-            links = soup.find_all(
-                "a",
-                href=True
-            )
+    recolectadas = list(por_clave.values())
 
-            embudo["anchors"] = len(links)
-
-            for posicion, item in enumerate(
-                links
-            ):
-                titulo = texto_del_enlace(item)
-
-                href = item.get(
-                    "href",
-                    ""
-                ).strip()
-
-                link = construir_url_absoluta(
-                    response.url,
-                    href
-                )
-
-                if not link:
-                    continue
-
-                # Normalizar: sin query ni fragment (utm_*, #comentarios...).
-                p = urlparse(link)
-                link = f"{p.scheme}://{p.netloc}{p.path}"
-
-                if not parece_articulo(
-                    link
-                ):
-                    embudo["no_articulo"] += 1
-                    continue
-
-                if (
-                    not titulo
-                    or len(titulo) < 20
-                ):
-                    embudo["texto_corto"] += 1
-                    continue
-
-                if not es_noticia_slrc(
-                    titulo,
-                    link
-                ):
-                    embudo["no_slrc"] += 1
-                    if DEBUG:
-                        log.info(f"  [no_slrc] {titulo} -> {link}")
-                    continue
-
-                # Mismo link visto antes en esta corrida: conservar el
-                # título más largo (suele ser el titular completo).
-                if link in vistos_en_corrida:
-                    previa = vistos_en_corrida[link]
-                    if len(titulo) > len(previa["titulo"]):
-                        previa["titulo"] = titulo
-                    embudo["repetido_en_corrida"] += 1
-                    continue
-
-                noticia = {
-                    "titulo": titulo,
-                    "link": link,
-                    "fuente":
-                        fuente["nombre"],
-                    "posicion":
-                        posicion
-                }
-
-                vistos_en_corrida[link] = noticia
-
-                if historial.ya_fue_enviada(
-                    noticia
-                ):
-                    embudo["ya_enviada"] += 1
-                    if DEBUG:
-                        log.info(f"  [ya_enviada] {titulo} -> {link}")
-                    continue
-
-                embudo["candidatas"] += 1
-
-                candidatas.append(
-                    noticia
-                )
-
-            log.info(
-                f"Embudo {fuente['nombre']}: "
-                + ", ".join(f"{k}={v}" for k, v in embudo.items())
-            )
-
-            if embudo["candidatas"] == 0 and embudo["no_articulo"] == embudo["anchors"]:
-                log.warning(
-                    f"{fuente['nombre']}: ningún link pasó parece_articulo(). "
-                    "Posible cambio de estructura de URLs o contenido cargado por JavaScript."
-                )
-
-        except requests.exceptions.RequestException as error:
-            log.warning(
-                "Error de red en "
-                f"{fuente['nombre']}: "
-                f"{error}"
-            )
-
-        except Exception as error:
-            log.exception(
-                "Error inesperado en "
-                f"{fuente['nombre']}: "
-                f"{error}"
-            )
-
-    candidatas = eliminar_duplicados(
-        candidatas
-    )
+    # 2) Quitar las ya enviadas (por ID de artículo y por título).
+    nuevas = [n for n in recolectadas if not historial.ya_fue_enviada(n)]
 
     log.info(
-        f"Candidatas únicas antes de fecha: "
-        f"{len(candidatas)}"
+        f"Recolectadas: {len(recolectadas)} únicas | "
+        f"ya enviadas: {len(recolectadas) - len(nuevas)} | "
+        f"nuevas: {len(nuevas)}"
     )
 
-    noticias_finales = []
-    rechazadas_fecha = 0
-    rechazadas_tras_og_title = 0
+    # 3) Completar fecha/imagen abriendo el artículo SOLO si falta algo
+    #    (las notas de RSS normalmente ya traen ambas).
+    revisadas = 0
+    for noticia in nuevas:
+        if noticia.get("fecha") and noticia.get("imagen"):
+            continue
+        if revisadas >= MAX_CANDIDATAS_A_REVISAR:
+            break
 
-    for noticia in candidatas[:MAX_CANDIDATAS_A_REVISAR]:
-
-        obtener_metadatos_articulo(
-            noticia
-        )
+        fecha_rss, imagen_rss = noticia.get("fecha"), noticia.get("imagen")
+        obtener_metadatos_articulo(noticia)
+        noticia["fecha"] = noticia.get("fecha") or fecha_rss
+        noticia["imagen"] = noticia.get("imagen") or imagen_rss
+        noticia["clave"] = clave_articulo(noticia["link"])
+        revisadas += 1
         time.sleep(0.3)
 
-        if not fecha_aceptable(
-            noticia.get("fecha")
-        ):
-            rechazadas_fecha += 1
-            log.info(
-                "Ignorada por fecha "
-                f"({noticia.get('fecha')}): "
-                f"{noticia['titulo']}"
-            )
-            continue
+    # 4) Filtrar por fecha, revalidar y quitar duplicados entre fuentes.
+    finales = []
+    claves_finales = set()
+    rechazadas_fecha = 0
+    duplicadas = 0
 
-        # El título pudo cambiar con og:title o el link con la redirección:
-        # revalidar contra historial y contra lo ya aceptado.
-        if historial.ya_fue_enviada(noticia) or any(
-            noticia["link"] == n["link"]
-            or titulo_parecido(noticia["titulo"], n["titulo"])
-            for n in noticias_finales
-        ):
-            rechazadas_tras_og_title += 1
-            continue
-
-        noticias_finales.append(
-            noticia
-        )
-
-    log.info(
-        f"Resultado: {len(noticias_finales)} aceptadas | "
-        f"{rechazadas_fecha} fuera de rango de fecha | "
-        f"{rechazadas_tras_og_title} duplicadas tras leer el artículo"
-    )
-
-    # Priorizar artículos fechados recientemente; los sin fecha quedan al final.
-    noticias_finales.sort(
+    # Ordenar primero por fecha para que, entre duplicados, gane la más completa.
+    nuevas.sort(
         key=lambda n: n.get("fecha") or datetime.min.replace(tzinfo=TZ),
         reverse=True
     )
-    return noticias_finales
+
+    for noticia in nuevas:
+        if not fecha_aceptable(noticia.get("fecha")):
+            rechazadas_fecha += 1
+            if DEBUG:
+                log.info(f"  [fecha {noticia.get('fecha')}] {noticia['titulo']}")
+            continue
+
+        if (
+            noticia["clave"] in claves_finales
+            or historial.ya_fue_enviada(noticia)
+            or any(titulo_parecido(noticia["titulo"], n["titulo"]) for n in finales)
+        ):
+            duplicadas += 1
+            continue
+
+        claves_finales.add(noticia["clave"])
+        finales.append(noticia)
+
+    log.info(
+        f"Resultado: {len(finales)} listas para enviar | "
+        f"{rechazadas_fecha} fuera de rango de fecha | "
+        f"{duplicadas} duplicadas"
+    )
+
+    if len(finales) < MAX_NOTICIAS_POR_CORRIDA:
+        log.warning(
+            f"Solo hay {len(finales)} noticias nuevas (objetivo: "
+            f"{MAX_NOTICIAS_POR_CORRIDA}). Revisa los embudos de arriba."
+        )
+
+    return finales
 
 
 # ============================================================
@@ -1777,15 +1911,25 @@ def main():
     total_enviadas = 0
     total_fallidas = 0
 
+    claves_enviadas_corrida = set()
+
     for noticia in noticias_a_enviar:
         if total_enviadas >= MAX_NOTICIAS_POR_CORRIDA:
             break
+
+        # Doble seguro anti-repetición dentro de la misma corrida.
+        if (
+            noticia["clave"] in claves_enviadas_corrida
+            or historial.ya_fue_enviada(noticia)
+        ):
+            continue
 
         enviado = enviar_noticia(
             noticia
         )
 
         if enviado:
+            claves_enviadas_corrida.add(noticia["clave"])
             historial.registrar(
                 noticia
             )
